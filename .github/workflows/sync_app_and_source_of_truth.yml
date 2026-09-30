@@ -1,0 +1,99 @@
+# SYNC APP AND SOURCE OF TRUTH: pull the Google Sheet (source of truth), validate it, have
+# Claude review every card whose content changed, and open/update the sync PR. Nothing reaches
+# the live app or the sheet until that PR is merged (see publish_changes_to_source_of_truth.yml).
+#
+# Runs once a day at 6:00am US Eastern (EDT), and on demand:
+#   GitHub → Actions → "Sync app and source of truth" → "Run workflow".
+# The manual run has a "review_all" checkbox to make Claude re-review every card.
+name: Sync app and source of truth
+
+on:
+  schedule:
+    # GitHub cron is always UTC and ignores daylight saving. 10:00 UTC = 6:00am EDT
+    # (summer); from November to March (EST) this fires at 5:00am local time instead.
+    # GitHub can start scheduled runs a few minutes late when it's busy.
+    - cron: "0 10 * * *"
+  # Manual trigger.
+  workflow_dispatch:
+    inputs:
+      review_all:
+        description: "Have Claude review ALL cards (not only cards whose content changed)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sheet-sync
+  cancel-in-progress: false
+
+env:
+  BRANCH: sync/sheet
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # A full review of ~655 cards is ~33 Claude requests; leave generous headroom.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: poetry
+
+      - run: poetry install --no-interaction
+
+      - name: Carry over review results and rejections from the open sync PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/carry"
+          if [ "$(gh pr view "$BRANCH" --json state -q .state 2>/dev/null)" = "OPEN" ]; then
+            git fetch origin "$BRANCH"
+            for f in reviews.json sheet_edits.json; do
+              git show "origin/$BRANCH:data/$f" > "$RUNNER_TEMP/carry/$f" 2>/dev/null || rm -f "$RUNNER_TEMP/carry/$f"
+            done
+          fi
+
+      - name: Ingest, validate, review
+        env:
+          SHEET_ID: ${{ vars.SHEET_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Only true on a manual run with the box ticked; empty on scheduled runs.
+          REVIEW_ALL: ${{ inputs.review_all }}
+        run: |
+          extra=()
+          if [ "$REVIEW_ALL" = "true" ]; then extra+=(--review-all); fi
+          poetry run python scripts/sync_app_and_source_of_truth/sync.py \
+            --sheet-id "$SHEET_ID" \
+            --carry "$RUNNER_TEMP/carry" \
+            --pr-body "$RUNNER_TEMP/pr-body.md" \
+            "${extra[@]}"
+
+      - name: Open or update the sync PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add data reports
+          if git diff --cached --quiet -- data; then
+            echo "Sheet matches main; nothing to propose."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git commit -q -m "Sync vocab from Google Sheet"
+          git push -q --force origin "$BRANCH"
+          if [ "$(gh pr view "$BRANCH" --json state -q .state 2>/dev/null)" = "OPEN" ]; then
+            gh pr edit "$BRANCH" --body-file "$RUNNER_TEMP/pr-body.md"
+          else
+            gh pr create --head "$BRANCH" --base main \
+              --title "Vocab sync: review sheet changes and Claude's edits" \
+              --body-file "$RUNNER_TEMP/pr-body.md"
+          fi

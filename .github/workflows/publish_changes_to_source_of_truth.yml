@@ -1,0 +1,72 @@
+# PUBLISH CHANGES TO SOURCE OF TRUTH: on every push to main (e.g. merging the sync PR), write approved edits back to
+# the Google Sheet, rebuild cards.json, and deploy the app to GitHub Pages.
+# Can also be run by hand: GitHub → Actions → "Publish changes to source of truth" → "Run workflow".
+name: Publish changes to source of truth
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: sheet-sync
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: poetry
+
+      - run: poetry install --no-interaction
+
+      - run: poetry run pytest -q
+
+      - name: Write approved edits back to the Google Sheet
+        if: hashFiles('data/sheet_edits.json') != ''
+        env:
+          SHEET_ID: ${{ vars.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: poetry run python scripts/publish_changes_to_source_of_truth/writeback.py --sheet-id "$SHEET_ID"
+
+      - name: Rebuild cards.json
+        if: hashFiles('data/sheet_rows.json') != ''
+        run: poetry run python scripts/global_use/build.py
+
+      - name: Commit write-back results
+        run: |
+          git add data
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -q -m "Record sheet write-back"
+            git push -q
+          fi
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site/data
+          if [ -d app ]; then cp -R app/. _site/; fi
+          if [ -f data/cards.json ]; then cp data/cards.json _site/data/; fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

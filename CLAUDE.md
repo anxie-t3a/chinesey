@@ -47,7 +47,7 @@ Current counts after normalization: 673 rows, 654 unique cards. 23 words appear 
 
 ---
 
-## Ingest and validation (build step)
+## Ingest and validation (`scripts/sync_app_and_source_of_truth/sync.py`)
 
 Pull the whole workbook in one request, so new tabs appear automatically:
 
@@ -57,13 +57,13 @@ https://docs.google.com/spreadsheets/d/<SHEET_ID>/export?format=xlsx
 
 Parse it with openpyxl in Python, or SheetJS in Node. The fallback, one request per tab, is `…/gviz/tq?tqx=out:csv&sheet=<Tab Name>`, but that needs the tab names known in advance.
 
-**Validation: fail the build with a clear message naming tab + row + field**
+**Validation.** A broken tab header fails the job. Row errors **block that row**: it's left out of `cards.json` and listed in the PR report with its tab, row and field.
 1. Every group tab's header matches the schema exactly, in order.
 2. The required fields are non-empty on every non-blank row.
 3. `type` is in the allowed list.
 4. `measure_word` matches the format when present.
 5. `examples` parse into `hanzi | pinyin | english` triples when present.
-6. No duplicate card id within a tab.
+6. Duplicates within a tab (`scripts/sync_app_and_source_of_truth/diff.py`): exact duplicates and partial copies get a proposed `clear_row` edit. Conflicting duplicates and a repeated hanzi are flagged.
 7. `measure_word` is consistent across rows sharing a card id.
 8. Warn, but don't fail, if pinyin contains digits or hanzi contains Latin letters, or if the same hanzi produces different ids across tabs.
 
@@ -81,7 +81,8 @@ Before comparing, trim whitespace and normalize curly quotes/apostrophes (`’` 
       "type": "noun", "measure_word": "",
       "groups": ["Objects", "Places"],
       "notes": [{"group": "Objects", "text": "..."}, {"group": "Places", "text": "..."}],
-      "examples": [{"hanzi": "...", "pinyin": "...", "english": "..."}]
+      "examples": [{"hanzi": "...", "pinyin": "...", "english": "...", "group": "Objects"}],
+      "aliases": ["<old ids, so study progress survives identity edits>"]
     }
   ]
 }
@@ -105,26 +106,39 @@ Before comparing, trim whitespace and normalize curly quotes/apostrophes (`’` 
 
 ---
 
-## Hosting / CI (Option A, chosen)
+## Hosting / CI (Option A, chosen): PR-gated, two-way sync
 
-GitHub Pages plus a GitHub Actions workflow:
-- Triggers: `schedule` (e.g. every 6h), `workflow_dispatch`, and `push` to `main`.
-- Steps: fetch the xlsx → validate → write `data/cards.json` → build → deploy to Pages.
-- A validation failure fails the job, so the live site keeps serving the last good build.
-- Put the sheet ID in a repo variable (`SHEET_ID`), not hardcoded.
+The README "Sync pipeline" section covers setup. How it works:
+- `sync_app_and_source_of_truth.yml` runs daily at 10:00 UTC (6am EDT; 5am during EST, since GitHub cron is UTC-only) and on manual dispatch. It runs `scripts/sync_app_and_source_of_truth/sync.py`, which fetches the sheet, then validates, diffs, dedupes, runs the Claude review and builds. It then force-pushes branch `sync/sheet` and opens or updates one PR.
+  - The job carries over `reviews.json` and `sheet_edits.json` from the open PR. That avoids re-reviewing cards and keeps the reviewer's `"rejected"` statuses.
+- `publish_changes_to_source_of_truth.yml` runs on push to `main`. `scripts/publish_changes_to_source_of_truth/writeback.py` pushes `proposed` edits to the sheet with gspread and a service account. Each edit first checks that the cell still holds its "before" value. Then the job runs `scripts/global_use/build.py`, commits, and deploys to Pages.
+- Committed state lives in `data/`:
+  - `sheet_rows.json`: the sheet snapshot, used as the diff baseline. It mirrors the sheet, including after write-back.
+  - `cards.json`: the app data.
+  - `reviews.json`: Claude review cache, keyed by card id plus review hash.
+  - `sheet_edits.json`: pending edits.
+  - `edit_decisions.json`: applied, rejected and conflicting edits. Anything rejected is never re-proposed.
+  - `id_aliases.json`: old id → new id.
+  - `allowed_words.txt`: extra words example sentences may use.
+- Claude review (`scripts/sync_app_and_source_of_truth/review.py`): `claude-opus-5-5` at effort high, structured JSON output, `fallbacks: "default"`, batches of 20, no per-run cap. Reviews every card whose `review_hash` (id + measure word + notes + examples + groups) differs from its cache entry in `data/reviews.json`. `--review-all` (workflow_dispatch input `review_all`) ignores the cache. Example sentences must pass `vocab.unknown_parts`, which segments them into sheet vocab plus `allowed_words.txt`, and must contain the card's word. A failed sentence gets one retry.
+- Claude never edits notes; it only flags them.
 
 ---
 
-## Suggested repo layout
+## Repo layout
 
 ```
-/scripts/ingest.(py|ts)     # fetch + validate + emit data/cards.json
-/scripts/normalize.py       # one-time normalization used on the original sheet (reference only)
-/data/cards.json            # generated; commit it or build it in CI (decide)
-/data/source_snapshot.json  # raw pull of the original 13 tabs on 2026-09-30 (baseline)
-/app/                       # static front end
-/.github/workflows/deploy.yml
+/scripts/global_use/                          # used by both tasks: common, sheet (fetch/read/validate), edits, build (cards.json; also a CLI)
+/scripts/sync_app_and_source_of_truth/        # sync task: sync.py (entry point), diff, review (Claude), vocab (sentence check), report
+/scripts/publish_changes_to_source_of_truth/  # publish task: writeback.py (approved edits -> Google Sheet)
+    # The folders aren't Python packages; entry scripts add scripts/global_use to sys.path.
+    # Every file has a header docstring (purpose, when it runs); every function has a docstring.
+/tests/          # pytest (poetry run pytest); fakes for Claude + Sheets, no network
+/data/           # committed pipeline state (see above)
+/app/            # static front end (not built yet)
+/.github/workflows/sync_app_and_source_of_truth.yml, publish_changes_to_source_of_truth.yml
 ```
+Python deps are managed with Poetry (`package-mode = false`).
 
 ---
 
@@ -137,10 +151,13 @@ GitHub Pages plus a GitHub Actions workflow:
   - The Measure Words tab got short meanings plus examples with pinyin. Its commentary was moved out of Examples into Notes.
   - Every change (720) is logged in the sheet's `_changelog` tab.
 - Hosting: Option A (GitHub Pages + scheduled Action) chosen over live client-side fetch and a Claude Artifact.
+- 2026-09-30: sync is PR-gated. Claude's corrections and example sentences are proposed in the PR and written back to the sheet on merge, so the sheet stays the source of truth. Example sentences use only sheet vocab plus `data/allowed_words.txt`. `cards.json` is committed.
 
 ## Open items
 
 - [x] Normalized data is in the source sheet (confirmed 2026-09-30: 13 tabs, 7-column schema, no `card_id`).
 - 2026-09-30: dropped `card_id` from the sheet schema. The id is now derived in the build.
 - [ ] T to review the `_review` tab (e.g. 本来 gloss, 长路口/短路口, 急转, 赚 living in Food).
-- [ ] Decide whether `data/cards.json` is committed or built only in CI.
+- [x] Repo made public (needed for free GitHub Pages).
+- [ ] T to set up the repo variable and secrets, the service account, and Pages (docs/SETUP.md).
+- [ ] Build the front end in `/app/`.

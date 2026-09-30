@@ -1,16 +1,25 @@
 [project]
 name = "chinesey"
 version = "0.1.0"
-description = "Mandarin Vocabulary Flashcard Application"
+description = "Mandarin Vocabulary Flashcards"
 authors = [
     {name = "Ammie Tea",email = "tea.ammie@gmail.com"}
 ]
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic (>=1.10,<2)",
+    "gspread (>=6.2,<7)",
+    "openpyxl (>=3.1,<4)"
 ]
 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9"
+

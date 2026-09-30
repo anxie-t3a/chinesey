@@ -1,0 +1,20 @@
+# Function words Claude may use in example sentences in addition to the vocab in the sheet.
+# Keep this short: anything that is really vocab belongs in the sheet instead.
+# Whitespace-separated; "#" starts a comment.
+
+# pronouns
+我 你 他 她 它 我们 你们 他们 她们 咱们 自己 大家
+# copula, existence, location
+是 有 没有 在
+# particles
+的 地 得 了 过 着 吗 呢 吧 啊
+# negation and basic adverbs
+不 没 很 太 也 还 就 才 又 最 真
+# modal verbs
+要 会 能 可以
+# demonstratives and question words
+这 那 这个 那个 这里 那里 这儿 那儿 哪 哪里 哪儿 什么 谁 怎么 为什么 多少 几
+# basic prepositions and connectors
+跟 给 对 从 比
+# numbers
+一 二 两 三 四 五 六 七 八 九 十 百 千 万 半
